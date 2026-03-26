@@ -299,7 +299,7 @@ with tab_detail:
         ic4.markdown(f"""
         <div class='card' style='text-align:center;'>
             <div style='font-size:11px;color:#999;'>AVG BREACH COST</div>
-            <div style='font-size:24px;font-weight:900;color:#ef4444;'>${premium['avg_breach_cost_m']}M</div>
+            <div style='font-size:24px;font-weight:900;color:#ef4444;'>${premium.get('avg_breach_cost_m', 'N/A')}M</div>
         </div>""", unsafe_allow_html=True)
 
     # Breach History
