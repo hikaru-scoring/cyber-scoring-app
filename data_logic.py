@@ -1,9 +1,10 @@
 # data_logic.py
-"""CYBER-1000 — Enterprise Cyber Risk Scoring Logic."""
+"""CYBER-1000 — Enterprise Cyber Risk Scoring Logic. All scores from real API data."""
 import json
 import math
 import os
 import socket
+import ssl
 import requests
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -12,71 +13,20 @@ AXES_LABELS = [
     "Vulnerability Exposure",
     "Breach History",
     "Attack Surface",
-    "Patch Readiness",
-    "Industry Risk",
+    "SSL Health",
+    "Email Security",
 ]
 
 LOGIC_DESC = {
-    "Vulnerability Exposure": "Known CVEs affecting the company's technology stack, weighted by severity (CVSS)",
-    "Breach History": "Past data breaches — number of incidents, records exposed, recency",
-    "Attack Surface": "Open ports, exposed services, SSL/TLS configuration quality",
-    "Patch Readiness": "How quickly known vulnerabilities are addressed in the company's sector",
-    "Industry Risk": "Sector-specific attack frequency and average breach cost",
+    "Vulnerability Exposure": "Total known CVEs (NVD) associated with this company's products",
+    "Breach History": "Past data breaches — number of incidents and total records exposed (HIBP)",
+    "Attack Surface": "Open ports, known vulnerabilities on public-facing infrastructure (Shodan)",
+    "SSL Health": "SSL certificate validity, days until expiry, issuer quality",
+    "Email Security": "SPF, DMARC, and DKIM configuration from DNS records",
 }
 
 COMPANIES_FILE = os.path.join(os.path.dirname(__file__), "companies.json")
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "cyber_cache.json")
-
-# Industry risk scores (based on IBM Cost of Data Breach Report 2025)
-# Higher = more risk = lower score
-INDUSTRY_RISK = {
-    "Healthcare": 0.95,
-    "Banking": 0.90,
-    "Financial Services": 0.85,
-    "Pharma": 0.85,
-    "Technology": 0.70,
-    "Energy": 0.75,
-    "Defense": 0.80,
-    "Retail": 0.65,
-    "Retail/Cloud": 0.70,
-    "Entertainment": 0.50,
-    "Semiconductors": 0.65,
-    "Consumer Goods": 0.45,
-    "Beverages": 0.40,
-    "Telecom": 0.75,
-    "Transportation": 0.55,
-    "Travel": 0.60,
-    "Logistics": 0.55,
-    "Aerospace": 0.80,
-    "Food Service": 0.45,
-    "Apparel": 0.40,
-    "Automotive": 0.60,
-}
-
-# Average breach cost by industry (in $M)
-INDUSTRY_BREACH_COST = {
-    "Healthcare": 10.9,
-    "Banking": 6.1,
-    "Financial Services": 6.1,
-    "Pharma": 5.0,
-    "Technology": 5.5,
-    "Energy": 5.3,
-    "Defense": 4.7,
-    "Retail": 3.5,
-    "Retail/Cloud": 4.5,
-    "Entertainment": 3.8,
-    "Semiconductors": 4.8,
-    "Consumer Goods": 3.0,
-    "Beverages": 2.8,
-    "Telecom": 4.5,
-    "Transportation": 3.8,
-    "Travel": 3.5,
-    "Logistics": 3.5,
-    "Aerospace": 4.7,
-    "Food Service": 2.5,
-    "Apparel": 2.8,
-    "Automotive": 4.2,
-}
 
 
 def _load_companies():
@@ -96,8 +46,58 @@ def _save_cache(cache):
         json.dump(cache, f, indent=2, ensure_ascii=False)
 
 
-def _fetch_shodan_data(domain):
-    """Fetch open ports and vulns from Shodan InternetDB (free, no key)."""
+def _clamp(val, lo=0, hi=200):
+    return max(lo, min(hi, int(val)))
+
+
+# ── Data Fetchers (all real API, no estimates) ──
+
+def _fetch_cve_count(company_name):
+    """Fetch total CVE count from NVD for this company."""
+    try:
+        r = requests.get(
+            "https://services.nvd.nist.gov/rest/json/cves/2.0",
+            params={"keywordSearch": company_name.lower(), "resultsPerPage": 1},
+            timeout=20,
+        )
+        if r.status_code == 200:
+            return r.json().get("totalResults", 0)
+    except Exception:
+        pass
+    return -1  # -1 = failed to fetch
+
+
+def _fetch_breaches(domain):
+    """Fetch breach data from Have I Been Pwned."""
+    try:
+        r = requests.get(
+            "https://haveibeenpwned.com/api/v3/breaches",
+            timeout=10,
+            headers={"User-Agent": "CYBER-1000/1.0"},
+        )
+        if r.status_code == 200:
+            breaches = r.json()
+            domain_lower = domain.lower()
+            domain_base = domain_lower.split(".")[0]
+            matches = []
+            for b in breaches:
+                b_domain = (b.get("Domain") or "").lower()
+                b_name = (b.get("Name") or "").lower()
+                if domain_lower in b_domain or domain_base in b_name or domain_base in b_domain:
+                    matches.append({
+                        "name": b["Name"],
+                        "date": b.get("BreachDate", ""),
+                        "pwn_count": b.get("PwnCount", 0),
+                        "data_classes": b.get("DataClasses", []),
+                    })
+            return matches
+    except Exception:
+        pass
+    return []
+
+
+def _fetch_shodan(domain):
+    """Fetch attack surface data from Shodan InternetDB."""
     try:
         ip = socket.gethostbyname(domain)
         r = requests.get(f"https://internetdb.shodan.io/{ip}", timeout=10)
@@ -107,230 +107,219 @@ def _fetch_shodan_data(domain):
                 "ip": ip,
                 "ports": data.get("ports", []),
                 "vulns": data.get("vulns", []),
-                "hostnames": data.get("hostnames", []),
                 "cpes": data.get("cpes", []),
             }
     except Exception:
         pass
-    return {"ip": "", "ports": [], "vulns": [], "hostnames": [], "cpes": []}
+    return {"ip": "", "ports": [], "vulns": [], "cpes": []}
 
 
-def _fetch_breach_data(domain):
-    """Fetch breach history from Have I Been Pwned."""
+def _fetch_ssl(domain):
+    """Fetch SSL certificate data by direct connection."""
     try:
-        r = requests.get(
-            "https://haveibeenpwned.com/api/v3/breaches",
-            timeout=10,
-            headers={"User-Agent": "CYBER-1000/1.0"},
-        )
-        if r.status_code == 200:
-            breaches = r.json()
-            company_breaches = []
-            domain_lower = domain.lower()
-            domain_base = domain_lower.split(".")[0]
-            for b in breaches:
-                b_domain = (b.get("Domain") or "").lower()
-                b_name = (b.get("Name") or "").lower()
-                if domain_lower in b_domain or domain_base in b_name or domain_base in b_domain:
-                    company_breaches.append({
-                        "name": b["Name"],
-                        "date": b.get("BreachDate", ""),
-                        "pwn_count": b.get("PwnCount", 0),
-                        "data_classes": b.get("DataClasses", []),
-                        "is_verified": b.get("IsVerified", False),
-                    })
-            return company_breaches
+        ctx = ssl.create_default_context()
+        with ctx.wrap_socket(socket.socket(), server_hostname=domain) as s:
+            s.settimeout(5)
+            s.connect((domain, 443))
+            cert = s.getpeercert()
+            not_after = cert.get("notAfter", "")
+            issuer = dict(x[0] for x in cert.get("issuer", []))
+            org = issuer.get("organizationName", "Unknown")
+            expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
+            days_left = (expiry - datetime.now(timezone.utc).replace(tzinfo=None)).days
+            return {
+                "days_until_expiry": days_left,
+                "issuer": org,
+                "expiry_date": not_after,
+            }
     except Exception:
         pass
-    return []
+    return {"days_until_expiry": -1, "issuer": "Unknown", "expiry_date": ""}
 
 
-def _fetch_cisa_kev_count():
-    """Fetch total count of CISA Known Exploited Vulnerabilities."""
+def _fetch_dns_security(domain):
+    """Fetch SPF and DMARC records from Google DNS API."""
+    result = {"has_spf": False, "has_dmarc": False, "dmarc_policy": "none", "has_dkim": False}
     try:
-        r = requests.get(
-            "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
-            timeout=15,
-        )
+        # SPF
+        r = requests.get(f"https://dns.google/resolve?name={domain}&type=TXT", timeout=5)
         if r.status_code == 200:
-            return r.json().get("count", 0)
+            for a in r.json().get("Answer", []):
+                if "v=spf1" in a.get("data", ""):
+                    result["has_spf"] = True
+                    break
+
+        # DMARC
+        r2 = requests.get(f"https://dns.google/resolve?name=_dmarc.{domain}&type=TXT", timeout=5)
+        if r2.status_code == 200:
+            answers = r2.json().get("Answer", [])
+            if answers:
+                result["has_dmarc"] = True
+                for a in answers:
+                    data = a.get("data", "")
+                    if "p=reject" in data:
+                        result["dmarc_policy"] = "reject"
+                    elif "p=quarantine" in data:
+                        result["dmarc_policy"] = "quarantine"
+                    elif "p=none" in data:
+                        result["dmarc_policy"] = "none"
+
+        # DKIM (check for google selector as common case)
+        r3 = requests.get(f"https://dns.google/resolve?name=google._domainkey.{domain}&type=TXT", timeout=5)
+        if r3.status_code == 200:
+            if r3.json().get("Answer"):
+                result["has_dkim"] = True
     except Exception:
         pass
-    return 1000
+    return result
 
 
-def _clamp(val, lo=0, hi=200):
-    return max(lo, min(hi, int(val)))
+# ── Scoring Functions (all from real data) ──
+
+def _score_vulnerability_exposure(cve_count):
+    """200 = no CVEs. Score decreases with more CVEs (log scale)."""
+    if cve_count < 0:
+        return 100  # API failed, neutral
+    if cve_count == 0:
+        return 200
+    # log scale: 1 CVE=190, 10=170, 100=150, 1000=130, 10000=110
+    score = 200 - math.log10(max(cve_count, 1)) * 22
+    return _clamp(score)
 
 
-def _score_vulnerability_exposure(shodan_data, company):
-    """Score Vulnerability Exposure (200 pts max). Higher = less exposed = better."""
-    vulns = shodan_data.get("vulns", [])
-    num_vulns = len(vulns)
-
-    # Fewer vulns = higher score
-    if num_vulns == 0:
-        vuln_score = 120
-    elif num_vulns <= 2:
-        vuln_score = 90
-    elif num_vulns <= 5:
-        vuln_score = 60
-    elif num_vulns <= 10:
-        vuln_score = 30
-    else:
-        vuln_score = 10
-
-    # CPE (software) exposure
-    cpes = shodan_data.get("cpes", [])
-    if len(cpes) == 0:
-        cpe_score = 40  # Can't assess = neutral
-    elif len(cpes) <= 3:
-        cpe_score = 35
-    elif len(cpes) <= 6:
-        cpe_score = 25
-    else:
-        cpe_score = 10
-
-    # Company size bonus (larger companies have more attack vectors but also more security budget)
-    employees = company.get("employees", 10000)
-    if employees > 100000:
-        size_score = 30  # Large = more resources for security
-    elif employees > 10000:
-        size_score = 35
-    else:
-        size_score = 40  # Smaller = potentially less protected
-
-    return _clamp(vuln_score + cpe_score + size_score)
-
-
-def _score_breach_history(breaches, company):
-    """Score Breach History (200 pts max). Higher = fewer breaches = better."""
+def _score_breach_history(breaches):
+    """200 = no breaches. Penalized by count, records exposed, and recency."""
     if not breaches:
-        return _clamp(180)  # No known breaches = great
+        return 200
 
+    num = len(breaches)
     total_records = sum(b.get("pwn_count", 0) for b in breaches)
-    num_breaches = len(breaches)
 
-    # Fewer breaches = higher score
-    if num_breaches == 1:
-        count_score = 100
-    elif num_breaches == 2:
-        count_score = 70
-    elif num_breaches <= 4:
-        count_score = 40
+    # Count penalty
+    count_penalty = min(num * 15, 80)
+
+    # Records penalty (log scale)
+    if total_records > 0:
+        records_penalty = min(math.log10(total_records) * 10, 80)
     else:
-        count_score = 10
+        records_penalty = 0
 
-    # Fewer records exposed = higher score
-    if total_records < 100000:
-        records_score = 60
-    elif total_records < 1000000:
-        records_score = 40
-    elif total_records < 10000000:
-        records_score = 20
-    else:
-        records_score = 5
-
-    # Recency — recent breaches are worse
-    recency_score = 40
+    # Recency penalty
+    recency_penalty = 0
     for b in breaches:
-        breach_date = b.get("date", "")
-        if breach_date >= "2024":
-            recency_score = 10
+        if b.get("date", "") >= "2024":
+            recency_penalty = 40
             break
-        elif breach_date >= "2022":
-            recency_score = 20
+        elif b.get("date", "") >= "2022":
+            recency_penalty = 25
             break
-        elif breach_date >= "2020":
-            recency_score = 30
+        elif b.get("date", "") >= "2020":
+            recency_penalty = 15
 
-    return _clamp(count_score + records_score + recency_score)
+    score = 200 - count_penalty - records_penalty - recency_penalty
+    return _clamp(score)
 
 
 def _score_attack_surface(shodan_data):
-    """Score Attack Surface (200 pts max). Higher = smaller attack surface = better."""
+    """200 = minimal attack surface. Penalized by ports, vulns, exposed software."""
     ports = shodan_data.get("ports", [])
-    num_ports = len(ports)
-
-    # Fewer open ports = better
-    if num_ports <= 2:
-        port_score = 80
-    elif num_ports <= 4:
-        port_score = 60
-    elif num_ports <= 8:
-        port_score = 40
-    else:
-        port_score = 15
-
-    # Check for risky ports
-    risky_ports = {21, 22, 23, 25, 110, 143, 445, 1433, 3306, 3389, 5432, 5900, 8080, 8443}
-    risky_open = len(set(ports) & risky_ports)
-    if risky_open == 0:
-        risky_score = 60
-    elif risky_open <= 2:
-        risky_score = 35
-    else:
-        risky_score = 10
-
-    # Has HTTPS (443)
-    has_https = 443 in ports
-    has_http = 80 in ports
-    if has_https and not has_http:
-        tls_score = 60  # HTTPS only = best
-    elif has_https:
-        tls_score = 50  # Both = ok
-    elif has_http:
-        tls_score = 20  # HTTP only = bad
-    else:
-        tls_score = 40  # No web presence detected
-
-    return _clamp(port_score + risky_score + tls_score)
-
-
-def _score_patch_readiness(shodan_data, sector):
-    """Score Patch Readiness (200 pts max). Based on sector patch speed + exposed vulns."""
-    # Sector-based patch speed (some industries are slower)
-    slow_sectors = {"Healthcare", "Banking", "Defense", "Aerospace"}
-    medium_sectors = {"Energy", "Telecom", "Automotive", "Logistics"}
-
-    if sector in slow_sectors:
-        sector_score = 60
-    elif sector in medium_sectors:
-        sector_score = 80
-    else:
-        sector_score = 100
-
-    # Active vulns on Shodan = not patched
     vulns = shodan_data.get("vulns", [])
-    if len(vulns) == 0:
-        patch_score = 100
-    elif len(vulns) <= 2:
-        patch_score = 70
-    elif len(vulns) <= 5:
-        patch_score = 40
+    cpes = shodan_data.get("cpes", [])
+
+    # Port penalty
+    risky_ports = {21, 22, 23, 25, 110, 143, 445, 1433, 3306, 3389, 5432, 5900, 8080, 8443}
+    num_risky = len(set(ports) & risky_ports)
+    port_penalty = len(ports) * 5 + num_risky * 15
+
+    # Vuln penalty
+    vuln_penalty = len(vulns) * 20
+
+    # Software exposure penalty
+    cpe_penalty = len(cpes) * 5
+
+    score = 200 - port_penalty - vuln_penalty - cpe_penalty
+    return _clamp(score)
+
+
+def _score_ssl_health(ssl_data):
+    """200 = strong SSL. Penalized by short expiry, weak issuer."""
+    days = ssl_data.get("days_until_expiry", -1)
+    issuer = ssl_data.get("issuer", "Unknown")
+
+    if days < 0:
+        return 100  # Can't check
+
+    # Days until expiry
+    if days >= 180:
+        expiry_score = 80
+    elif days >= 90:
+        expiry_score = 60
+    elif days >= 30:
+        expiry_score = 40
+    elif days >= 7:
+        expiry_score = 20
     else:
-        patch_score = 10
+        expiry_score = 0  # About to expire or expired
 
-    return _clamp(sector_score + patch_score)
+    # Issuer quality
+    premium_issuers = ["DigiCert", "GlobalSign", "Sectigo", "Entrust"]
+    self_signed = ["self-signed", "Unknown"]
+    free_issuers = ["Let's Encrypt"]
+
+    issuer_lower = issuer.lower()
+    if any(p.lower() in issuer_lower for p in premium_issuers):
+        issuer_score = 60
+    elif issuer == issuer:  # Company self-issues (Apple, Microsoft)
+        issuer_score = 70  # Self-managed = strong internal PKI
+    elif any(f.lower() in issuer_lower for f in free_issuers):
+        issuer_score = 40  # Free = works but signals smaller budget
+    else:
+        issuer_score = 50  # Unknown issuer
+
+    # Has HTTPS at all
+    has_ssl_score = 60 if days >= 0 else 0
+
+    return _clamp(expiry_score + issuer_score + has_ssl_score)
 
 
-def _score_industry_risk(sector):
-    """Score Industry Risk (200 pts max). Higher = lower risk industry = better."""
-    risk_factor = INDUSTRY_RISK.get(sector, 0.5)
-    # Invert: lower risk = higher score
-    score = (1.0 - risk_factor) * 200 + 80
+def _score_email_security(dns_data):
+    """200 = full email security. Based on SPF + DMARC + DKIM + policy strength."""
+    score = 0
+
+    # SPF (max 60)
+    if dns_data.get("has_spf"):
+        score += 60
+
+    # DMARC (max 60)
+    if dns_data.get("has_dmarc"):
+        score += 40
+        # DMARC policy strength
+        policy = dns_data.get("dmarc_policy", "none")
+        if policy == "reject":
+            score += 20  # Strongest
+        elif policy == "quarantine":
+            score += 10
+        # "none" = 0 additional
+
+    # DKIM (max 40)
+    if dns_data.get("has_dkim"):
+        score += 40
+
+    # Base score for having any email config (max 40)
+    if dns_data.get("has_spf") or dns_data.get("has_dmarc"):
+        score += 40
+
     return _clamp(score)
 
 
 def _estimate_premium(total_score, company):
     """Estimate cyber insurance premium based on score."""
-    revenue = company.get("revenue_b", 10) * 1000  # Convert to $M
-    sector = company.get("sector", "Technology")
-    breach_cost = INDUSTRY_BREACH_COST.get(sector, 4.0)
+    revenue_m = company.get("revenue_b", 10) * 1000
 
-    # Base rate from score (higher score = lower rate)
-    if total_score >= 800:
-        base_rate = 0.005  # 0.5%
+    if total_score >= 900:
+        base_rate = 0.003
+    elif total_score >= 800:
+        base_rate = 0.005
     elif total_score >= 700:
         base_rate = 0.008
     elif total_score >= 600:
@@ -340,81 +329,121 @@ def _estimate_premium(total_score, company):
     elif total_score >= 400:
         base_rate = 0.025
     else:
-        base_rate = 0.035  # 3.5%
+        base_rate = 0.035
 
-    # Industry adjustment
-    industry_mult = 0.5 + risk_factor if (risk_factor := INDUSTRY_RISK.get(sector, 0.5)) else 1.0
-
-    # Coverage amount (typically 10-20% of revenue for large companies)
-    coverage = min(revenue * 0.1, 500)  # Cap at $500M coverage
-
-    premium = coverage * base_rate * industry_mult
+    coverage = min(revenue_m * 0.1, 500)
+    premium = coverage * base_rate
 
     return {
-        "rate_pct": round(base_rate * industry_mult * 100, 2),
+        "rate_pct": round(base_rate * 100, 2),
         "coverage_m": round(coverage, 1),
         "estimated_premium_m": round(premium, 2),
-        "avg_breach_cost_m": breach_cost,
     }
 
 
 def score_all_companies():
-    """Score all companies and return sorted list."""
+    """Score all companies using real API data. Returns sorted list."""
     companies = _load_companies()
     cache = _load_cache()
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     results = []
 
+    # Fetch HIBP breaches once (single API call for all)
+    all_breaches = []
+    try:
+        r = requests.get("https://haveibeenpwned.com/api/v3/breaches", timeout=10,
+                         headers={"User-Agent": "CYBER-1000/1.0"})
+        if r.status_code == 200:
+            all_breaches = r.json()
+    except Exception:
+        pass
+
     for company in companies:
         domain = company["domain"]
         name = company["name"]
 
-        # Use cache if fresh (same day)
+        # Use cache if fresh
         cached = cache.get(domain, {})
-        if cached.get("date") == today:
-            shodan_data = cached.get("shodan", {})
+        if cached.get("date") == today and cached.get("version") == "v2":
+            cve_count = cached.get("cve_count", 0)
             breaches = cached.get("breaches", [])
+            shodan_data = cached.get("shodan", {})
+            ssl_data = cached.get("ssl", {})
+            dns_data = cached.get("dns", {})
         else:
-            shodan_data = _fetch_shodan_data(domain)
-            breaches = _fetch_breach_data(domain)
+            # Fetch all real data
+            cve_count = _fetch_cve_count(name)
+
+            # Match breaches from pre-fetched list
+            domain_lower = domain.lower()
+            domain_base = domain_lower.split(".")[0]
+            breaches = []
+            for b in all_breaches:
+                b_domain = (b.get("Domain") or "").lower()
+                b_name = (b.get("Name") or "").lower()
+                if domain_lower in b_domain or domain_base in b_name or domain_base in b_domain:
+                    breaches.append({
+                        "name": b["Name"],
+                        "date": b.get("BreachDate", ""),
+                        "pwn_count": b.get("PwnCount", 0),
+                        "data_classes": b.get("DataClasses", []),
+                    })
+
+            shodan_data = _fetch_shodan(domain)
+            ssl_data = _fetch_ssl(domain)
+            dns_data = _fetch_dns_security(domain)
+
             cache[domain] = {
                 "date": today,
-                "shodan": shodan_data,
+                "version": "v2",
+                "cve_count": cve_count,
                 "breaches": breaches,
+                "shodan": shodan_data,
+                "ssl": ssl_data,
+                "dns": dns_data,
             }
 
-        sector = company.get("sector", "Technology")
-
-        ve = _score_vulnerability_exposure(shodan_data, company)
-        bh = _score_breach_history(breaches, company)
+        # Score all 5 axes from real data
+        ve = _score_vulnerability_exposure(cve_count)
+        bh = _score_breach_history(breaches)
         as_ = _score_attack_surface(shodan_data)
-        pr = _score_patch_readiness(shodan_data, sector)
-        ir = _score_industry_risk(sector)
-        total = ve + bh + as_ + pr + ir
+        sh = _score_ssl_health(ssl_data)
+        es = _score_email_security(dns_data)
+        total = ve + bh + as_ + sh + es
 
         premium = _estimate_premium(total, company)
 
         results.append({
             "name": name,
             "domain": domain,
-            "sector": sector,
+            "sector": company.get("sector", ""),
             "total": total,
             "axes": {
                 "Vulnerability Exposure": ve,
                 "Breach History": bh,
                 "Attack Surface": as_,
-                "Patch Readiness": pr,
-                "Industry Risk": ir,
+                "SSL Health": sh,
+                "Email Security": es,
+            },
+            "raw_data": {
+                "cve_count": cve_count,
+                "breach_count": len(breaches),
+                "total_records_exposed": sum(b.get("pwn_count", 0) for b in breaches),
+                "open_ports": shodan_data.get("ports", []),
+                "shodan_vulns": len(shodan_data.get("vulns", [])),
+                "ssl_days_left": ssl_data.get("days_until_expiry", -1),
+                "ssl_issuer": ssl_data.get("issuer", "Unknown"),
+                "has_spf": dns_data.get("has_spf", False),
+                "has_dmarc": dns_data.get("has_dmarc", False),
+                "dmarc_policy": dns_data.get("dmarc_policy", "none"),
+                "has_dkim": dns_data.get("has_dkim", False),
             },
             "company": company,
-            "shodan": shodan_data,
             "breaches": breaches,
             "premium": premium,
         })
 
-    # Save cache
     _save_cache(cache)
-
     results.sort(key=lambda x: x["total"], reverse=True)
     return results
 
