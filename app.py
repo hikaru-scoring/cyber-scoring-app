@@ -70,7 +70,7 @@ def generate_excel(data, axes_labels, logic_desc):
 
 # ── Page config ──
 APP_TITLE = "CYBER-1000 — Enterprise Cyber Risk Scoring"
-st.set_page_config(page_title=APP_TITLE, layout="wide")
+st.set_page_config(page_title=APP_TITLE, page_icon="🔒", layout="wide")
 inject_css()
 st.markdown("""
 <style>
