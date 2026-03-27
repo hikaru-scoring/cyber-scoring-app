@@ -18,11 +18,11 @@ AXES_LABELS = [
 ]
 
 LOGIC_DESC = {
-    "Vulnerability Exposure": "Total known CVEs (NVD) associated with this company's products",
-    "Breach History": "Past data breaches — number of incidents and total records exposed (HIBP)",
-    "Attack Surface": "Open ports, known vulnerabilities on public-facing infrastructure (Shodan)",
-    "SSL Health": "SSL certificate validity, days until expiry, issuer quality",
-    "Email Security": "SPF, DMARC, and DKIM configuration from DNS records",
+    "Vulnerability Exposure": "Known CVEs from NVD database",
+    "Breach History": "Past breach incidents and records exposed",
+    "Attack Surface": "Open ports and exposed infrastructure",
+    "SSL Health": "Certificate validity and issuer quality",
+    "Email Security": "SPF, DMARC, and DKIM configuration",
 }
 
 COMPANIES_FILE = os.path.join(os.path.dirname(__file__), "companies.json")

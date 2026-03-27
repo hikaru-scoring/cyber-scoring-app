@@ -244,6 +244,22 @@ with tab_detail:
                 </div>
                 <p style="font-size: 1.05em; color: #777777; margin: 0; line-height: 1.3; font-weight: 500;">{desc_text}</p>
             </div>""", unsafe_allow_html=True)
+            raw = selected.get("raw_data", {})
+            with st.expander(f"Why {v1}?", expanded=False):
+                if ax == "Vulnerability Exposure":
+                    st.markdown(f"**Formula:** `200 - log10(CVE count) x 22` (0 CVEs = 200)\n\n**Data:** {raw.get('cve_count', 0)} CVEs found\n\n**Source:** NVD (National Vulnerability Database)")
+                elif ax == "Breach History":
+                    st.markdown(f"**Formula:** `200 - count penalty - records penalty - recency penalty`\n\n**Data:** {raw.get('breach_count', 0)} breaches, {raw.get('total_records_exposed', 0):,} records exposed\n\n**Source:** Have I Been Pwned (HIBP)")
+                elif ax == "Attack Surface":
+                    ports = raw.get('open_ports', [])
+                    st.markdown(f"**Formula:** `200 - port penalty - vuln penalty - software exposure`\n\n**Data:** {len(ports)} open ports, {raw.get('shodan_vulns', 0)} known vulns\n\n**Source:** Shodan")
+                elif ax == "SSL Health":
+                    st.markdown(f"**Formula:** `Expiry score (max 80) + Issuer quality (max 70) + HTTPS bonus (max 60)`\n\n**Data:** {raw.get('ssl_days_left', -1)} days until expiry, Issuer: {raw.get('ssl_issuer', 'Unknown')}\n\n**Source:** Direct SSL certificate check")
+                elif ax == "Email Security":
+                    spf = "Yes" if raw.get('has_spf') else "No"
+                    dmarc = "Yes" if raw.get('has_dmarc') else "No"
+                    dkim = "Yes" if raw.get('has_dkim') else "No"
+                    st.markdown(f"**Formula:** `SPF (max 60) + DMARC + policy (max 60) + DKIM (max 40) + base (max 40)`\n\n**Data:** SPF: {spf}, DMARC: {dmarc} ({raw.get('dmarc_policy', 'none')}), DKIM: {dkim}\n\n**Source:** DNS record lookup")
 
     # Company Snapshot
     st.markdown("<div class='section-title'>III. Company Snapshot</div>", unsafe_allow_html=True)
